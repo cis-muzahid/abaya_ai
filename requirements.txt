@@ -1,0 +1,10 @@
+django
+channels 
+channels-redis
+python-dotenv
+python-decouple
+django-cors-headers
+daphne
+Pillow
+requests
+openai

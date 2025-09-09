@@ -1,0 +1,265 @@
+import os
+import re
+import time
+import json
+import base64
+from io import BytesIO
+from PIL import Image
+import requests
+from openai import OpenAI
+from channels.generic.websocket import WebsocketConsumer
+from django.conf import settings
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+class ChatConsumer(WebsocketConsumer):
+    USER_INPUT_LIST = []
+    DEFAULT_IMAGE_PATH = "http://localhost:8000/media/abaya1.webp"
+    LOCAL_IMAGE_PATH = "http://localhost:8000/"
+    
+    def connect(self):
+        print("Connected >>>>")
+        self.accept()
+
+    def disconnect(self, close_code):
+        print("DiConnected <<<<<<<")
+        pass
+
+    def receive(self, text_data):
+        data = json.loads(text_data)
+        message = data.get('message', '')
+        base64_image = data.get('image_url')
+        reply_to_message = data.get('reply_to')
+        print("Data:", data)
+        ChatConsumer.USER_INPUT_LIST.append(message)
+        print(ChatConsumer.USER_INPUT_LIST)
+        
+        if base64_image:
+            # Handle base64 image
+            try:
+                saved_image_url = self.save_base64_image(base64_image)
+                response = "Image uploaded successfully!"
+                self.chat_send({
+                    "response": response,
+                    "image_url": saved_image_url,
+                    "reply_to": reply_to_message, 
+                })
+            except Exception as e:
+                # Handle decoding or saving errors
+                self.chat_send({
+                    "response": f"Failed to upload image: {str(e)}",
+                    "image_url": saved_image_url,
+                    "reply_to": reply_to_message, 
+                })
+        elif message and data.get('reply_to'):
+            if reply_to_message.get('previous_user_input'):
+                # Process message with reply context
+                try:
+                    previous_user_input = reply_to_message.get('previous_user_input')
+                    # edited_image_url = self.edit_image_with_prompt(prompt=message, previous_msg_image_path=reply_to_message)
+                    
+                    edited_image_url_via_old_res = self.edit_image_with_previous_user_input(new_prompt=message, previous_prompt_list=ChatConsumer.USER_INPUT_LIST)
+                    print(edited_image_url_via_old_res)
+                    self.chat_send({
+                        "response": f"Here is your edited Abaya design for: {message}",
+                        "image_url": edited_image_url_via_old_res,
+                        "reply_to": reply_to_message,
+                    })
+                except Exception as e:
+                    self.chat_send({
+                        "response": f"Failed to edit image.",
+                        "image_url": None,
+                        "reply_to": reply_to_message,
+                    })
+         
+        else:
+            # Process other text-based messages
+            message = ChatConsumer.USER_INPUT_LIST
+            if reply_to_message is None:
+                message = ChatConsumer.USER_INPUT_LIST[-1]
+            try:
+                image_url = self.generate_dalle_image(message)
+                self.chat_send({
+                    "response": f"Here is your Abaya design for: {message}",
+                    "image_url": image_url
+                })
+            except Exception as e:
+                # Send fallback message with default image
+                print(str(e))
+                self.chat_send({
+                    "response": f"Failed to generate design",
+                    "image_url": self.DEFAULT_IMAGE_PATH
+                })
+
+    def save_base64_image(self, base64_image):
+        """
+        Decodes a base64 image and saves it to the media directory.
+        Returns the URL of the saved image.
+        """
+        img_format, img_str = base64_image.split(';base64,')
+        ext = img_format.split('/')[-1]  # Extract the file extension (e.g., png, jpeg)
+        # file_name = f"uploaded_{self.scope.get('session').session_key}.{ext}"
+        file_name = f"image_{time.time()}.{ext}"
+        file_path = os.path.join(settings.MEDIA_ROOT, file_name)
+
+        # self.LOCAL_IMAGE_PATH
+        # Decode and save the image
+        with open(file_path, "wb") as f:
+            f.write(base64.b64decode(img_str))
+
+        # Generate path for the saved image
+        file_path = f"{self.LOCAL_IMAGE_PATH}media/{file_name}"
+        return file_path
+
+
+    def chat_send(self, response_data):
+        """
+        Sends structured response data directly.
+        """
+        self.send(text_data=json.dumps(response_data))
+
+
+    # API key and endpoint
+    def generate_dalle_image(self, prompt):
+        user_filters = {
+            "Department": ["Women's", "Girls'"],
+            "Style": ["Formal", "Casual", "Workwear"],
+            "Length": ["Maxi", "Mini"],
+            "Color": ["Pink", "White", "Green", "Navy Blue", "Purple", "Beige", "Gold"],
+            "Sleeve Style": ["Long Sleeve", "Short Sleeve", "Sleeveless", "Three Quarter Sleeve", "Half Sleeve"],
+            "Pattern": ["Floral", "Solid", "Striped", "Camouflage", "Plaid"],
+            "Embellishment Style": ["Embroidery", "Print", "Beads", "Rhinestones", "Applique"],
+            "Material": ["Satin", "Lace", "Chiffon", "Silk", "Linen", "Cotton", "Organza"],
+            "Occasion": ["Wedding Dresses", "Cocktail & Party Dresses", "Bridesmaid Dresses"],
+            "Sleeve Type": ["Kimono", "Batwing", "Puff", "Butterfly", "Balloon", "Ruffle", "Cape"],
+            "Neckline": ["V-neck", "Round Neck", "Collared", "High Neck", "Sweetheart", "Boat Neck"],
+            "Silhouette": ["Wrap", "Asymmetrical", "Empire Waist", "Fitted", "Mermaid", "Fit and Flare"],
+            "Type": ["Bride", "Bridesmaid"],
+            "Features": ["With Slit", "Two-piece"]
+        }
+        predefined_prompt = f"""
+        Generate a single hyper-realistic image of an Abaya dress design with the following requirements:
+        1. The image must include four full-length views of the Abaya: 
+            - Front view (centered and clearly detailed).
+            - Back view (displaying back design).
+            - Left side view (Specialy for shoulder view).
+            - Right side view (Specialy for shoulder view).
+
+        2. The design should reflect the following user-selected filters:
+            - **Style**: {user_filters.get('Style')}.
+            - **Occasion**: {user_filters.get('Occasion')}.
+            - **Length**: {user_filters.get('Length')}.
+            - **Color**: {user_filters.get('Color')}.
+            - **Sleeve Style**: {user_filters.get('Sleeve Style')}.
+            - **Pattern**: {user_filters.get('Pattern')}.
+            - **Embellishment Style**: {user_filters.get('Embellishment Style')}.
+            - **Material**: {user_filters.get('Material')}.
+            - **Neckline**: {user_filters.get('Neckline')}.
+            - **Silhouette**: {user_filters.get('Silhouette')}.
+            - **Features**: {user_filters.get('Features')}.
+        3. The design should showcase intricate embroidery and patterns asked in design description.
+        4. Use a rich, sophisticated color palette asked in the design description.
+        5. Ensure the fabric texture appears luxurious, like silk or velvet, with high attention to details in lighting and folds and whatever asked in the design description.
+        6. Avoid generating any irrelevant elements; only focus on the Abaya dress and its poses.
+        7. Maintain a clean, light-colored background for emphasis on the design.
+        8. Use high-quality lighting and shading to emphasize the fabric and design.
+        9. The image must be generated in a **1920x1080 high resolution** for maximum detail.
+
+        Use the selected filters to create the design in accordance with the given attributes.
+        NOTE: Realism photo full portrait, THE GENERATED IMAGE MUST BE FROM HEAD TO FEETS, MEANS FULL HEIGHTED IMAGE.
+        Here is the design description: {prompt}
+        """
+        final_prompt = predefined_prompt
+        # predefined_prompt = "Realism photo full portrait, I need an abaya design with wine color canvas in net pattern, look should be bridal dubai patter, add some golden embroideries on neck and hands."
+        try:
+            breakpoint()
+            print("Generating the image..")
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=final_prompt,
+                n=1,
+                size="1024x1024"
+            )
+            print("Generated DONE..")
+            image_url = response.data[0].url
+            print("New image: ", image_url)
+
+            return image_url
+        except requests.exceptions.RequestException as e:
+            return f"Request failed: {e}"
+        except ValueError:
+            return "Error parsing the response. Ensure the API returned a valid JSON."
+        except KeyError:
+            return "Unexpected response format. Could not find the expected data."
+
+
+
+    def edit_image_with_prompt(self, prompt, previous_msg_image_path):
+        """
+        Combines a provided image with a prompt to generate a new image using DALL-E.
+        """
+        print("Editable prompt:", prompt)
+        match = re.search(r'src=([^\s>]+)', previous_msg_image_path)
+        if match:
+            image_url = match.group(1)
+            print("Extracted URL:", image_url)
+        else:
+            print("No URL found.")
+
+        # get_image = requests.get(image_url, verify=False)
+        tmpImg = Image.open(requests.get(image_url, stream=True, verify=False).raw).convert("RGBA")
+        file_name = 'previous_image3.png'
+        mask_file_name = 'test1.png'
+        file_path = os.path.join(settings.MEDIA_ROOT, file_name)
+        mask_file_path = os.path.join(settings.MEDIA_ROOT, mask_file_name)
+        tmpImg.save(file_path, "PNG")
+        prompt = """
+        1. Your job is to do updation in the image that is passing in image parameter. 2. Do not change the whole image like keep the same dress, pattern, size, dimentions, base color, Just update whatever is passed in the promt: """+ prompt
+        try:
+            print("Editing the image..")    
+            response = client.images.edit(
+                image = open(file_path,"rb"),
+                mask = open(mask_file_path,"rb"),
+                prompt=prompt,
+                n=1,
+                size="1024x1024",
+            )
+            print("Edited DONE..")
+            new_image_url = response.data[0].url
+            print("Edited image: ", new_image_url)
+            return new_image_url
+        except requests.exceptions.RequestException as e:
+            return f"Request failed: {e}"
+        except ValueError:
+            return "Error parsing the response. Ensure the API returned a valid JSON."
+        except KeyError:
+            return "Unexpected response format. Could not find the expected data."
+
+    def edit_image_with_previous_user_input(self, new_prompt, previous_prompt_list):
+        """
+        Combines a provided image with a prompt to generate a new image using DALL-E.
+        """
+        print("Editable prompt list:", previous_prompt_list, '\n')
+        aggrigated_prompt = ", ".join(f"'{item}'" for item in previous_prompt_list)
+        final_prompt = f"""1. Your job is to do updation in the image that is previously created by previous prompts {previous_prompt_list}. 2. Do not change the whole image, keep the same dress, pattern, size, dimentions, base color if not asked in the prompt, Just update whatever is passed in the latest prompts: """ + aggrigated_prompt
+        # final_prompt = new_prompt + previous_prompt_list
+        try:
+            print("Editing the image..")    
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=final_prompt,
+                n=1,
+                size="1024x1024"
+            )
+            print("Edited DONE..")
+            new_image_url = response.data[0].url
+            print("Edited image: ", new_image_url)
+            return new_image_url
+        except requests.exceptions.RequestException as e:
+            return f"Request failed: {e}"
+        except ValueError:
+            return "Error parsing the response. Ensure the API returned a valid JSON."
+        except KeyError:
+            return "Unexpected response format. Could not find the expected data."
+
